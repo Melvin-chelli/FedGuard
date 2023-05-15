@@ -1,0 +1,135 @@
+# All
+- hosts: cloud.*, edge.*
+  vars:
+    container_name: "fl-container"
+  prepare:
+    - include_vars: "{{ scenario_dir }}/vars/vars.yaml"
+
+    - name: Copying files
+      synchronize:
+        src: '{{ artifacts_dir }}/'
+        dest: '/tmp/app/'
+      delegate_to: "{{ inventory_hostname }}"
+
+    - name: Building docker image
+      shell: 'docker build /tmp/app/. --tag gpu-docker'
+    - name: Running docker image
+      shell: 'docker run --network=host --gpus all --name {{ container_name }} -t -d gpu-docker'
+    - name: Downloading dataset
+      shell: 'docker exec -t {{ container_name }} python3 /app/artifacts/utils/dl_dataset.py --dataset {{ dataset }}'
+    - name: Generating partitions
+      shell: 'docker exec -t {{ container_name }} python3 /app/artifacts/utils/partition_data.py --n_partitions {{ n_part }} --dataset {{ dataset }} --alpha {{ alpha }}'
+  
+
+# Server
+- hosts: cloud.FLServer.*
+  vars:
+    container_name: "fl-container"
+    malicious_index_table: '{{range(malicious_index)}}'
+  prepare:
+    - name: Mkdir
+      shell: 'mkdir -p /app/fl_logs'
+    - name: Starting Tensorboard
+      shell: 'docker exec -t -d {{ container_name }} python3 -m tensorboard.main --logdir /app/fl_logs'
+
+  launch:
+    - include_vars: "{{ scenario_dir }}/vars/vars.yaml"
+    - debug:
+        msg: "Starting FLServer: {{ _self.url }}"
+    - shell: 'sudo docker exec -t {{ container_name }} python3 /app/artifacts/server.py
+              --server_address {{ _self.url }}:8080
+              --attack {{ attack }}
+              --strategy {{ strategy }}
+              --model {{ model }}
+              --num_rounds {{ num_rounds }}
+              --min_available_clients {{ min_available_clients }}
+              --min_fit_clients {{ min_fit_clients }}
+              --fraction_fit {{ fraction_fit }}
+              --server_lr {{ server_lr }}
+              --server_momentum {{ server_momentum }}
+              --local_epochs {{ local_epochs }}
+              --cvae_local_epochs {{ cvae_local_epochs }}
+              --n_decoders_to_sample {{ n_decoders_to_sample }}
+              --n_evaluation_data_per_decoder {{ n_evaluation_data_per_decoder }}'
+      async: "{{ async }}"
+      poll: 0
+    - debug:
+        msg: "Starting FLClient: server at {{ _self.url }}"
+    - shell: "{% for thishost in play_hosts %}
+                {% if inventory_hostname==thishost %}
+                    {% if (item) in malicious_index_table %}
+                      sudo docker exec -t -e CUDA_VISIBLE_DEVICES={{ item // (n_client_server_node // 2) }} {{ container_name }} 
+                      python3 /app/artifacts/client.py
+                      --server_address {{ _self.url }}:8080
+                      --model {{ model }}
+                      --strategy {{ strategy }}
+                      --num {{ item }}
+                      --attack {{ attack }}
+                    {% else %}
+                      sudo docker exec -t -e CUDA_VISIBLE_DEVICES={{ item // (n_client_server_node // 2) }} {{ container_name }} 
+                      python3 /app/artifacts/client.py
+                      --server_address {{ _self.url }}:8080
+                      --model {{ model }}
+                      --strategy {{ strategy }}
+                      --num {{ item }}
+                      --attack 'none'
+                    {% endif %}
+                {% endif %}
+              {% endfor %}"
+      async: "{{ async }}"
+      poll: 0
+      loop: "{{ range(0, n_client_server_node)|list }}"
+
+  finalize:
+    - debug:
+        msg: "Retreiving log files"
+    - shell: "sudo docker cp {{ container_name }}:/app/fl_logs/ /home/user/runs/last/"
+    - debug:
+        msg: "Stop and remove container"
+    - shell: "docker stop {{ container_name }}"
+    - shell: "docker rm {{ container_name }}"
+
+# Clients
+- hosts: edge.FLClient.*
+  depends_on:
+    service_selector: "cloud.FLServer.*"
+    grouping: "round_robin"
+    prefix: "server"
+  vars:
+    container_name: "fl-container"
+    malicious_index_table: '{{range(malicious_index)}}'
+
+  launch:
+    - include_vars: "{{ scenario_dir }}/vars/vars.yaml"
+    - debug:
+        msg: "Starting FLClient: server at {{ server.url }}"
+    - shell: "{% for thishost in play_hosts %}
+                {% if inventory_hostname==thishost %}
+                  {% if ((n_client_per_node) * (loop.index - 1) + item + n_client_server_node) in malicious_index_table %}
+                    sudo docker exec -t -e CUDA_VISIBLE_DEVICES={{ item // (n_client_per_node // 2) }} {{ container_name }} 
+                    python3 /app/artifacts/client.py
+                    --server_address {{ server.url }}:8080
+                    --model {{ model }}
+                    --strategy {{ strategy }}
+                    --num {{ (n_client_per_node) * (loop.index - 1) + item + n_client_server_node }}
+                    --attack {{ attack }}
+                  {% else %}
+                    sudo docker exec -t -e CUDA_VISIBLE_DEVICES={{ item // (n_client_per_node // 2) }} {{ container_name }} 
+                    python3 /app/artifacts/client.py
+                    --server_address {{ server.url }}:8080
+                    --model {{ model }}
+                    --strategy {{ strategy }}
+                    --num {{ (n_client_per_node) * (loop.index - 1) + item + n_client_server_node }}
+                    --attack 'none'
+                  {% endif %}
+                {% endif %}
+              {% endfor %}"
+      async: "{{ async }}"
+      poll: 0
+      loop: "{{ range(0, n_client_per_node)|list }}"
+
+  finalize:
+    - debug:
+        msg: "Stop and remove container"
+    - shell: "docker stop {{ container_name }}"
+    - shell: "docker rm {{ container_name }}"

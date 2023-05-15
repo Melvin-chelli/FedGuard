@@ -1,0 +1,5 @@
+torch==1.13.0
+torchvision==0.14.0
+tensorboard==2.11.0
+flwr==1.1.0
+psutil==5.9.4

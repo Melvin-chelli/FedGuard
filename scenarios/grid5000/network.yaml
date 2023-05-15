@@ -1,0 +1,4 @@
+networks:
+- default_loss: 0.1
+  default_delay: "2ms"
+  default_rate: "10gbit"
